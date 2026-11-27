@@ -14,7 +14,7 @@ from playwright.sync_api import sync_playwright
 GAME_URL = "https://wayou.github.io/t-rex-runner/"
 
 # ---------- НАСТРОЙКИ ПАРАЛЛЕЛЬНОСТИ ----------
-NUM_WORKERS = 10        # Сколько копий игры запускать одновременно
+NUM_WORKERS = 7        # Сколько копий игры запускать одновременно
 HEADLESS = True         # True = скрытый режим (макс. скорость), False = видеть окна сеткой
 
 # ---------- НАСТРОЙКИ NEAT И СОХРАНЕНИЯ ----------
@@ -24,17 +24,18 @@ CHECKPOINT_DIR = "checkpoints_v2"
 CHECKPOINT_PREFIX = "neat-checkpoint-"
 KEEP_CHECKPOINTS = 5
 
-TRAIN_MODE = True       # True = обучение NEAT, False = просмотр лучшего бота в реальном времени
+TRAIN_MODE = False       # True = обучение NEAT, False = просмотр лучшего бота в реальном времени
 RESUME_TRAINING = True  # True = продолжать с чекпоинта / лучшего бота, False = начать с нуля
 GENERATIONS = 50        # Сколько поколений обучать за этот запуск
-TEST_GAMES = 10         # Сколько игр сыграть в режиме TRAIN_MODE = False
+TEST_GAMES = 20         # Сколько игр сыграть в режиме TRAIN_MODE = False
 
 # ---------- НАСТРОЙКИ УСКОРЕНИЯ И ПРОБИТИЯ ПОТОЛКА ----------
-TRAIN_SPEEDUP = 3                # Ускорение симуляции при обучении (1 = обычная скорость, 3–4 = быстрее с той же физикой)
-MAX_TRAIN_SCORE = 4000.0        # Потолок одного забега при обучении (чтобы неуязвимый бот не бежал вечно)
+TRAIN_SPEEDUP = 2                # Ускорение симуляции при обучении (1 = обычная скорость, 3–4 = быстрее с той же физикой)
+MAX_TRAIN_SCORE = 3000.0        # Потолок одного забега при обучении (чтобы неуязвимый бот не бежал вечно)
 TRAIN_START_SPEEDS = [6.0, 11.0] # Каждый бот играет 2 забега: с обычной скорости (6) и сразу с высокой (11)
 POLL_INTERVAL = 0.08             # Как часто Python проверяет, закончилась ли игра в браузере
 STALL_TIMEOUT = 8.0              # Если кадры замерли дольше 8 сек — перезагружаем страницу
+TRAIN_MAX_SECONDS = 75.0   # лимит ТОЛЬКО для обучения, на один забег
 
 # JS-скрипт: запрет паузы при потере фокуса окна
 ANTI_PAUSE_JS = """
@@ -422,6 +423,23 @@ BOT_ENGINE_JS = """
 
     return true;
 }
+    window.__neatStopRun = function() {
+    const r = window.Runner && window.Runner.instance_;
+    const run = window.__neatRun;
+    if (!run) return;
+
+    try {
+        releaseAllKeys(r, run);
+    } catch (e) {}
+
+    run.active = false;
+    run.done = true;
+
+    try {
+        r.stop();
+        r.paused = false;
+    } catch (e) {}
+};
 """
 
 
@@ -642,8 +660,11 @@ def bootstrap_game(page):
         raise RuntimeError("Не удалось установить JS-движок бота.")
 
 
-def play_one_game(page, net_data, speedup=1, max_score=0.0, start_speed=6.0, stop_event=None):
-    """Запускает один забег целиком внутри браузера и возвращает набранный счёт."""
+def play_one_game(page, net_data, speedup=1, max_score=0.0,
+                  start_speed=6.0, stop_event=None, max_seconds=None):
+    """max_seconds=None -> без лимита по времени (для теста)."""
+    start_time = time.time()
+
     for attempt in range(2):
         page.evaluate(
             "(cfg) => window.__neatStartRun(cfg)",
@@ -657,10 +678,20 @@ def play_one_game(page, net_data, speedup=1, max_score=0.0, start_speed=6.0, sto
 
         last_frame = -1
         last_progress = time.time()
+        last_heartbeat = time.time()
 
         while True:
             if stop_event and stop_event.is_set():
                 return 0.0
+
+            # ЛИМИТ ВРЕМЕНИ — только если max_seconds передан
+            if max_seconds is not None and time.time() - start_time > max_seconds:
+                try:
+                    page.evaluate("() => window.__neatStopRun()")
+                    status = page.evaluate("() => window.__neatGetStatus()")
+                    return float(status.get("score", 0.0))
+                except Exception:
+                    return 0.0
 
             time.sleep(POLL_INTERVAL)
             status = page.evaluate("() => window.__neatGetStatus()")
@@ -671,17 +702,25 @@ def play_one_game(page, net_data, speedup=1, max_score=0.0, start_speed=6.0, sto
                 return float(status["score"])
 
             frame = status["frame"]
+
             if frame != last_frame:
                 last_frame = frame
                 last_progress = time.time()
-            elif time.time() - last_progress > STALL_TIMEOUT:
-                # Если вкладка зависла — перезагружаем и пробуем ещё раз
-                if attempt == 0:
-                    page.reload(wait_until="networkidle", timeout=60000)
-                    time.sleep(1.5)
-                    bootstrap_game(page)
-                    break
-                return float(status["score"])
+            else:
+                if time.time() - last_progress > STALL_TIMEOUT:
+                    if attempt == 0:
+                        page.reload(wait_until="networkidle", timeout=60000)
+                        time.sleep(1.5)
+                        bootstrap_game(page)
+                        break
+                    return float(status.get("score", 0.0))
+
+            if time.time() - last_heartbeat > 5.0:
+                print(
+                    f"   ... игра идёт: кадр={frame}, очки={status['score']:.0f}",
+                    flush=True
+                )
+                last_heartbeat = time.time()
 
     return 0.0
 
@@ -764,13 +803,13 @@ def worker_loop(worker_id, total_workers, config_path, task_queue, result_queue,
                         if stop_event.is_set():
                             break
                         try:
-                            sc = play_one_game(
+                            score = play_one_game(
                                 page,
                                 net_data,
-                                speedup=TRAIN_SPEEDUP,
-                                max_score=MAX_TRAIN_SCORE,
-                                start_speed=start_speed,
-                                stop_event=stop_event,
+                                speedup=1,        # обычная скорость игры
+                                max_score=0.0,    # отключает раннюю остановку по очкам
+                                start_speed=6.0,  # стандартный старт
+                                # max_seconds НЕ передаём -> без лимита времени
                             )
                         except Exception as e:
                             print(f"[Воркер #{worker_id}] Ошибка в игре (ID={genome_id}): {e}")
